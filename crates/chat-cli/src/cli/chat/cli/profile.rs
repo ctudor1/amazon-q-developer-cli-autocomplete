@@ -98,14 +98,48 @@ impl ProfileSubcommand {
                     execute!(
                         session.stderr,
                         style::SetForegroundColor(Color::Green),
-                        style::Print(format!("\nCreated profile: {}\n\n", name)),
+                        style::Print(format!("\nCreated profile: {}\n", name)),
                         style::SetForegroundColor(Color::Reset)
                     )?;
-                    context_manager
-                        .switch_profile(os, &name)
-                        .await
-                        .map_err(|e| warn!(?e, "failed to switch to newly created profile"))
-                        .ok();
+                    
+                    // Automatically switch to the newly created profile
+                    match context_manager.switch_profile(os, &name).await {
+                        Ok(_) => {
+                            execute!(
+                                session.stderr,
+                                style::SetForegroundColor(Color::Green),
+                                style::Print(format!("Switched to profile: {}\n", name)),
+                                style::SetForegroundColor(Color::Reset)
+                            )?;
+                            
+                            // Reload MCP servers for the new profile
+                            let mut os_mut = os.clone();
+                            if let Err(e) = session.conversation.reload_mcp_servers_for_profile(
+                                &mut os_mut, 
+                                Some(&name), 
+                                &mut session.stderr
+                            ).await {
+                                // Log the error but don't fail the profile creation - graceful degradation
+                                execute!(
+                                    session.stderr,
+                                    style::SetForegroundColor(Color::DarkYellow),
+                                    style::Print(format!("Warning: Failed to reload MCP servers: {}\n", e)),
+                                    style::SetForegroundColor(Color::Reset)
+                                )?;
+                            }
+                        },
+                        Err(e) => {
+                            warn!(?e, "failed to switch to newly created profile");
+                            execute!(
+                                session.stderr,
+                                style::SetForegroundColor(Color::DarkYellow),
+                                style::Print(format!("Warning: Failed to switch to new profile: {}\n", e)),
+                                style::SetForegroundColor(Color::Reset)
+                            )?;
+                        }
+                    }
+                    
+                    execute!(session.stderr, style::Print("\n"))?;
                 },
                 Err(e) => print_err!(e),
             },
@@ -125,9 +159,27 @@ impl ProfileSubcommand {
                     execute!(
                         session.stderr,
                         style::SetForegroundColor(Color::Green),
-                        style::Print(format!("\nSwitched to profile: {}\n\n", name)),
+                        style::Print(format!("\nSwitched to profile: {}\n", name)),
                         style::SetForegroundColor(Color::Reset)
                     )?;
+                    
+                    // Reload MCP servers for the new profile to provide seamless tool availability
+                    let mut os_mut = os.clone();
+                    if let Err(e) = session.conversation.reload_mcp_servers_for_profile(
+                        &mut os_mut, 
+                        Some(&name), 
+                        &mut session.stderr
+                    ).await {
+                        // Log the error but don't fail the profile switch - graceful degradation
+                        execute!(
+                            session.stderr,
+                            style::SetForegroundColor(Color::DarkYellow),
+                            style::Print(format!("Warning: Failed to reload MCP servers: {}\n", e)),
+                            style::SetForegroundColor(Color::Reset)
+                        )?;
+                    }
+                    
+                    execute!(session.stderr, style::Print("\n"))?;
                 },
                 Err(e) => print_err!(e),
             },

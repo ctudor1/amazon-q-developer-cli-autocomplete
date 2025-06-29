@@ -21,6 +21,7 @@ use tracing::warn;
 use crate::cli::chat::tool_manager::{
     McpServerConfig,
     global_mcp_config_path,
+    profile_mcp_path,
     workspace_mcp_config_path,
 };
 use crate::cli::chat::tools::custom_tool::{
@@ -33,6 +34,7 @@ use crate::os::Os;
 pub enum Scope {
     Workspace,
     Global,
+    Profile,
 }
 
 impl std::fmt::Display for Scope {
@@ -40,6 +42,7 @@ impl std::fmt::Display for Scope {
         match self {
             Scope::Workspace => write!(f, "workspace"),
             Scope::Global => write!(f, "global"),
+            Scope::Profile => write!(f, "profile"),
         }
     }
 }
@@ -57,6 +60,9 @@ pub enum McpSubcommand {
     Import(ImportArgs),
     /// Get the status of a configured server
     Status(StatusArgs),
+    /// Configure profile-exclusive server usage
+    #[command(alias = "ab")]
+    UseProfileServersOnly(UseProfileServersOnlyArgs),
 }
 
 impl McpSubcommand {
@@ -67,6 +73,7 @@ impl McpSubcommand {
             Self::List(args) => args.execute(os, output).await?,
             Self::Import(args) => args.execute(os, output).await?,
             Self::Status(args) => args.execute(os, output).await?,
+            Self::UseProfileServersOnly(args) => args.execute(os, output).await?,
         }
 
         output.flush()?;
@@ -88,6 +95,9 @@ pub struct AddArgs {
     /// Where to add the server to.
     #[arg(long, value_enum)]
     pub scope: Option<Scope>,
+    /// Profile name when using profile scope
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Environment variables to use when launching the server
     #[arg(long, value_parser = parse_env_vars)]
     pub env: Vec<HashMap<String, String>>,
@@ -105,7 +115,7 @@ pub struct AddArgs {
 impl AddArgs {
     pub async fn execute(self, os: &Os, output: &mut impl Write) -> Result<()> {
         let scope = self.scope.unwrap_or(Scope::Workspace);
-        let config_path = resolve_scope_profile(os, self.scope)?;
+        let config_path = resolve_scope_profile(os, self.scope, self.profile.clone())?;
 
         let mut config: McpServerConfig = ensure_config_file(os, &config_path, output).await?;
 
@@ -150,12 +160,15 @@ pub struct RemoveArgs {
     pub name: String,
     #[arg(long, value_enum)]
     pub scope: Option<Scope>,
+    /// Profile name when using profile scope
+    #[arg(long)]
+    pub profile: Option<String>,
 }
 
 impl RemoveArgs {
     pub async fn execute(self, os: &Os, output: &mut impl Write) -> Result<()> {
         let scope = self.scope.unwrap_or(Scope::Workspace);
-        let config_path = resolve_scope_profile(os, self.scope)?;
+        let config_path = resolve_scope_profile(os, self.scope, self.profile.clone())?;
 
         if !os.fs.exists(&config_path) {
             writeln!(output, "\nNo MCP server configurations found.\n")?;
@@ -196,10 +209,23 @@ pub struct ListArgs {
 
 impl ListArgs {
     pub async fn execute(self, os: &Os, output: &mut impl Write) -> Result<()> {
-        let configs = get_mcp_server_configs(os, self.scope).await?;
+        let configs = get_mcp_server_configs(os, self.scope, self.profile.clone()).await?;
         if configs.is_empty() {
             writeln!(output, "No MCP server configurations found.\n")?;
             return Ok(());
+        }
+
+        // Check for profile exclusivity warning
+        if let Some(profile_name) = &self.profile {
+            for (scope, _path, cfg_opt) in &configs {
+                if let (Scope::Profile, Some(cfg)) = (scope, cfg_opt) {
+                    if cfg.use_profile_servers_only {
+                        queue_profile_exclusive_warning(output, profile_name)?;
+                        writeln!(output)?;
+                        break;
+                    }
+                }
+            }
         }
 
         for (scope, path, cfg_opt) in configs {
@@ -229,6 +255,9 @@ pub struct ImportArgs {
     pub file: String,
     #[arg(value_enum)]
     pub scope: Option<Scope>,
+    /// Profile name when using profile scope
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Overwrite an existing server with the same name
     #[arg(long, default_value_t = false)]
     pub force: bool,
@@ -237,7 +266,7 @@ pub struct ImportArgs {
 impl ImportArgs {
     pub async fn execute(self, os: &Os, output: &mut impl Write) -> Result<()> {
         let scope: Scope = self.scope.unwrap_or(Scope::Workspace);
-        let config_path = resolve_scope_profile(os, self.scope)?;
+        let config_path = resolve_scope_profile(os, self.scope, self.profile.clone())?;
         let mut dst_cfg = ensure_config_file(os, &config_path, output).await?;
 
         let src_path = expand_path(os, &self.file)?;
@@ -276,12 +305,28 @@ impl ImportArgs {
 pub struct StatusArgs {
     #[arg(long)]
     pub name: String,
+    /// Profile name when using profile scope
+    #[arg(long)]
+    pub profile: Option<String>,
 }
 
 impl StatusArgs {
     pub async fn execute(self, os: &Os, output: &mut impl Write) -> Result<()> {
-        let configs = get_mcp_server_configs(os, None).await?;
+        let configs = get_mcp_server_configs(os, None, self.profile.clone()).await?;
         let mut found = false;
+
+        // Check for profile exclusivity warning
+        if let Some(profile_name) = &self.profile {
+            for (scope, _path, cfg_opt) in &configs {
+                if let (Scope::Profile, Some(cfg)) = (scope, cfg_opt) {
+                    if cfg.use_profile_servers_only {
+                        queue_profile_exclusive_warning(output, profile_name)?;
+                        writeln!(output)?;
+                        break;
+                    }
+                }
+            }
+        }
 
         for (sc, path, cfg_opt) in configs {
             if let Some(cfg) = cfg_opt.and_then(|c| c.mcp_servers.get(&self.name).cloned()) {
@@ -313,47 +358,163 @@ impl StatusArgs {
     }
 }
 
-async fn get_mcp_server_configs(
-    os: &Os,
-    scope: Option<Scope>,
-) -> Result<Vec<(Scope, PathBuf, Option<McpServerConfig>)>> {
-    let mut targets = Vec::new();
-    match scope {
-        Some(scope) => targets.push(scope),
-        None => targets.extend([Scope::Workspace, Scope::Global]),
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct UseProfileServersOnlyArgs {
+    /// Profile name to configure
+    #[arg(long)]
+    pub profile: String,
+    /// Whether to use only profile servers (true) or allow inheritance (false)
+    #[arg(long, value_name = "BOOLEAN", default_value = "true", action = clap::ArgAction::Set)]
+    pub value: bool,
+}
 
-    let mut results = Vec::new();
-    for sc in targets {
-        let path = resolve_scope_profile(os, Some(sc))?;
-        let cfg_opt = if os.fs.exists(&path) {
-            match McpServerConfig::load_from_file(os, &path).await {
-                Ok(cfg) => Some(cfg),
+impl UseProfileServersOnlyArgs {
+    pub async fn execute(self, os: &Os, output: &mut impl Write) -> Result<()> {
+        // Get the profile MCP path
+        let profile_mcp_path = profile_mcp_path(os, &self.profile)?;
+
+        // Check if the profile exists
+        let profile_dir = profile_mcp_path
+            .parent()
+            .ok_or_else(|| eyre::eyre!("Invalid profile path"))?;
+        
+        if !os.fs.exists(profile_dir) {
+            bail!("Profile '{}' does not exist", self.profile);
+        }
+
+        // Load or create the profile MCP configuration
+        let mut config = if os.fs.exists(&profile_mcp_path) {
+            match McpServerConfig::load_from_file(os, &profile_mcp_path).await {
+                Ok(config) => config,
                 Err(e) => {
-                    warn!(?path, error = %e, "Invalid MCP config file—ignored, treated as null");
-                    None
+                    warn!("Failed to load profile MCP config: {}", e);
+                    McpServerConfig::default()
                 },
             }
         } else {
-            None
+            McpServerConfig::default()
         };
-        results.push((sc, path, cfg_opt));
+
+        // Set the exclusivity flag
+        config.use_profile_servers_only = self.value;
+
+        // Save the configuration
+        if let Some(parent) = profile_mcp_path.parent() {
+            os.fs.create_dir_all(parent).await?;
+        }
+        config.save_to_file(os, &profile_mcp_path).await?;
+
+        writeln!(
+            output,
+            "✓ Set profile '{}' to {} use profile-specific MCP servers exclusively\n",
+            self.profile,
+            if self.value { "now" } else { "no longer" }
+        )?;
+
+        Ok(())
     }
+}
+
+/// Enhanced multi-scope configuration loading with profile exclusivity support
+async fn get_mcp_server_configs(
+    os: &Os,
+    scope: Option<Scope>,
+    profile: Option<String>,
+) -> Result<Vec<(Scope, PathBuf, Option<McpServerConfig>)>> {
+    let mut results = Vec::new();
+    
+    // If a specific scope is requested, only load that scope
+    if let Some(requested_scope) = scope {
+        let path = resolve_scope_profile(os, Some(requested_scope), profile)?;
+        let cfg_opt = load_config_with_error_handling(os, &path).await;
+        results.push((requested_scope, path, cfg_opt));
+        return Ok(results);
+    }
+
+    // Multi-scope loading in priority order: Profile → Workspace → Global
+    let mut scopes_to_load = Vec::new();
+    
+    // Add Profile scope if profile name is provided
+    if let Some(ref profile_name) = profile {
+        scopes_to_load.push((Scope::Profile, Some(profile_name.clone())));
+    }
+    
+    // Always add Workspace and Global scopes
+    scopes_to_load.push((Scope::Workspace, None));
+    scopes_to_load.push((Scope::Global, None));
+
+    // Load configurations in order and check for profile exclusivity
+    for (scope_type, profile_name) in scopes_to_load {
+        let path = resolve_scope_profile(os, Some(scope_type), profile_name)?;
+        let cfg_opt = load_config_with_error_handling(os, &path).await;
+        
+        // Check for profile exclusivity
+        if let (Scope::Profile, Some(cfg)) = (&scope_type, &cfg_opt) {
+            if cfg.use_profile_servers_only {
+                // Profile exclusivity is enabled - only return profile configuration
+                results.push((scope_type, path, cfg_opt));
+                return Ok(results);
+            }
+        }
+        
+        results.push((scope_type, path, cfg_opt));
+    }
+    
     Ok(results)
+}
+
+/// Helper function to load configuration with consistent error handling
+async fn load_config_with_error_handling(
+    os: &Os,
+    path: &PathBuf,
+) -> Option<McpServerConfig> {
+    if os.fs.exists(path) {
+        match McpServerConfig::load_from_file(os, path).await {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                warn!(?path, error = %e, "Invalid MCP config file—ignored, treated as null");
+                None
+            },
+        }
+    } else {
+        None
+    }
 }
 
 fn scope_display(scope: &Scope) -> String {
     match scope {
         Scope::Workspace => "📄 workspace".into(),
         Scope::Global => "🌍 global".into(),
+        Scope::Profile => "👤 profile".into(),
     }
 }
 
-fn resolve_scope_profile(os: &Os, scope: Option<Scope>) -> Result<PathBuf> {
+fn resolve_scope_profile(os: &Os, scope: Option<Scope>, profile: Option<String>) -> Result<PathBuf> {
     Ok(match scope {
         Some(Scope::Global) => global_mcp_config_path(os)?,
+        Some(Scope::Profile) => {
+            let profile_name = profile.ok_or_else(|| eyre::eyre!("Profile name is required when using profile scope"))?;
+            profile_mcp_path(os, &profile_name)?
+        },
         _ => workspace_mcp_config_path(os)?,
     })
+}
+
+fn queue_profile_exclusive_warning(output: &mut impl Write, profile_name: &str) -> Result<()> {
+    writeln!(
+        output,
+        "⚠️  Profile '{}' is configured for exclusive server usage.",
+        profile_name
+    )?;
+    writeln!(
+        output, 
+        "   Only MCP servers defined in this profile will be loaded."
+    )?;
+    writeln!(
+        output,
+        "   Global and workspace servers will be ignored."
+    )?;
+    Ok(())
 }
 
 fn expand_path(os: &Os, p: &str) -> Result<PathBuf> {
@@ -414,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn test_scope_and_profile_defaults_to_workspace() {
         let os = Os::new().await.unwrap();
-        let path = resolve_scope_profile(&os, None).unwrap();
+        let path = resolve_scope_profile(&os, None, None).unwrap();
         assert_eq!(
             path.to_str(),
             workspace_mcp_config_path(&os).unwrap().to_str(),
@@ -426,11 +587,11 @@ mod tests {
     async fn test_resolve_paths() {
         let os = Os::new().await.unwrap();
         // workspace
-        let p = resolve_scope_profile(&os, Some(Scope::Workspace)).unwrap();
+        let p = resolve_scope_profile(&os, Some(Scope::Workspace), None).unwrap();
         assert_eq!(p, workspace_mcp_config_path(&os).unwrap());
 
         // global
-        let p = resolve_scope_profile(&os, Some(Scope::Global)).unwrap();
+        let p = resolve_scope_profile(&os, Some(Scope::Global), None).unwrap();
         assert_eq!(p, global_mcp_config_path(&os).unwrap());
     }
 
@@ -461,6 +622,7 @@ mod tests {
             env: vec![],
             timeout: None,
             scope: None,
+            profile: None,
             disabled: false,
             force: false,
         }
@@ -477,6 +639,7 @@ mod tests {
         RemoveArgs {
             name: "local".into(),
             scope: None,
+            profile: None,
         }
         .execute(&os, &mut vec![])
         .await
@@ -510,6 +673,7 @@ mod tests {
                     "--allow-sensitive-data-access".to_string(),
                 ],
                 scope: None,
+                profile: None,
                 env: vec![
                     [
                         ("key1".to_string(), "value1".to_string()),
@@ -532,6 +696,7 @@ mod tests {
             RootSubcommand::Mcp(McpSubcommand::Remove(RemoveArgs {
                 name: "old".into(),
                 scope: None,
+                profile: None,
             }))
         );
     }
@@ -543,6 +708,7 @@ mod tests {
             RootSubcommand::Mcp(McpSubcommand::Import(ImportArgs {
                 file: "servers.json".into(),
                 scope: None,
+                profile: None,
                 force: true,
             }))
         );
@@ -552,7 +718,10 @@ mod tests {
     fn test_mcp_subcommand_status_simple() {
         assert_parse!(
             ["mcp", "status", "--name", "aws"],
-            RootSubcommand::Mcp(McpSubcommand::Status(StatusArgs { name: "aws".into() }))
+            RootSubcommand::Mcp(McpSubcommand::Status(StatusArgs { 
+                name: "aws".into(),
+                profile: None,
+            }))
         );
     }
 

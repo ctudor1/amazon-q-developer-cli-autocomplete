@@ -94,7 +94,10 @@ use crate::mcp_client::{
 };
 use crate::os::Os;
 use crate::telemetry::TelemetryThread;
-use crate::util::directories::home_dir;
+use crate::util::directories::{
+    chat_profiles_dir,
+    home_dir,
+};
 
 const NAMESPACE_DELIMITER: &str = "___";
 // This applies for both mcp server and tool name since in the end the tool name as seen by the
@@ -108,6 +111,74 @@ pub fn workspace_mcp_config_path(os: &Os) -> eyre::Result<PathBuf> {
 
 pub fn global_mcp_config_path(os: &Os) -> eyre::Result<PathBuf> {
     Ok(home_dir(os)?.join(".aws").join("amazonq").join("mcp.json"))
+}
+
+pub fn profile_mcp_path(os: &Os, profile_name: &str) -> eyre::Result<PathBuf> {
+    Ok(chat_profiles_dir(os)?.join(profile_name).join("mcp.json"))
+}
+
+/// Gets MCP server configuration for a specific profile, using the multi-scope loading logic
+pub async fn get_mcp_server_configs_for_profile(os: &Os, profile_name: Option<&str>) -> eyre::Result<McpServerConfig> {
+    // This is a simplified version of the multi-scope loading logic for the reload scenario
+    // It loads configurations in priority order: Profile → Workspace → Global
+    let mut final_config = McpServerConfig::default();
+    
+    // Load global config first (lowest priority)
+    let global_path = global_mcp_config_path(os)?;
+    if os.fs.exists(&global_path) {
+        match McpServerConfig::load_from_file(os, &global_path).await {
+            Ok(config) => {
+                for (name, server_config) in config.mcp_servers {
+                    final_config.mcp_servers.insert(name, server_config);
+                }
+            },
+            Err(e) => {
+                warn!("Failed to load global MCP config: {}", e);
+            }
+        }
+    }
+    
+    // Load workspace config (medium priority)
+    let workspace_path = workspace_mcp_config_path(os)?;
+    if os.fs.exists(&workspace_path) {
+        match McpServerConfig::load_from_file(os, &workspace_path).await {
+            Ok(config) => {
+                for (name, server_config) in config.mcp_servers {
+                    final_config.mcp_servers.insert(name, server_config);
+                }
+            },
+            Err(e) => {
+                warn!("Failed to load workspace MCP config: {}", e);
+            }
+        }
+    }
+    
+    // Load profile config if specified (highest priority)
+    if let Some(profile_name) = profile_name {
+        let profile_path = profile_mcp_path(os, profile_name)?;
+        if os.fs.exists(&profile_path) {
+            match McpServerConfig::load_from_file(os, &profile_path).await {
+                Ok(config) => {
+                    // Check for profile exclusivity
+                    if config.use_profile_servers_only {
+                        // Return only profile servers when exclusivity is enabled
+                        return Ok(config);
+                    }
+                    
+                    // Otherwise, merge profile servers with others (profile takes precedence)
+                    for (name, server_config) in config.mcp_servers {
+                        final_config.mcp_servers.insert(name, server_config);
+                    }
+                    final_config.use_profile_servers_only = config.use_profile_servers_only;
+                },
+                Err(e) => {
+                    warn!("Failed to load profile MCP config for {}: {}", profile_name, e);
+                }
+            }
+        }
+    }
+    
+    Ok(final_config)
 }
 
 /// Messages used for communication between the tool initialization thread and the loading
@@ -153,45 +224,11 @@ pub enum LoadingRecord {
 #[serde(rename_all = "camelCase")]
 pub struct McpServerConfig {
     pub mcp_servers: HashMap<String, CustomToolConfig>,
+    #[serde(default)]
+    pub use_profile_servers_only: bool,
 }
 
 impl McpServerConfig {
-    pub async fn load_config(stderr: &mut impl Write) -> eyre::Result<Self> {
-        let mut cwd = std::env::current_dir()?;
-        cwd.push(".amazonq/mcp.json");
-        let expanded_path = shellexpand::tilde("~/.aws/amazonq/mcp.json");
-        let global_path = PathBuf::from(expanded_path.as_ref() as &str);
-        let global_buf = tokio::fs::read(global_path).await.ok();
-        let local_buf = tokio::fs::read(cwd).await.ok();
-        let conf = match (global_buf, local_buf) {
-            (Some(global_buf), Some(local_buf)) => {
-                let mut global_conf = Self::from_slice(&global_buf, stderr, "global")?;
-                let local_conf = Self::from_slice(&local_buf, stderr, "local")?;
-                for (server_name, config) in local_conf.mcp_servers {
-                    if global_conf.mcp_servers.insert(server_name.clone(), config).is_some() {
-                        queue!(
-                            stderr,
-                            style::SetForegroundColor(style::Color::Yellow),
-                            style::Print("WARNING: "),
-                            style::ResetColor,
-                            style::Print("MCP config conflict for "),
-                            style::SetForegroundColor(style::Color::Green),
-                            style::Print(server_name),
-                            style::ResetColor,
-                            style::Print(". Using workspace version.\n")
-                        )?;
-                    }
-                }
-                global_conf
-            },
-            (None, Some(local_buf)) => Self::from_slice(&local_buf, stderr, "local")?,
-            (Some(global_buf), None) => Self::from_slice(&global_buf, stderr, "global")?,
-            _ => Default::default(),
-        };
-
-        stderr.flush()?;
-        Ok(conf)
-    }
 
     pub async fn load_from_file(os: &Os, path: impl AsRef<Path>) -> eyre::Result<Self> {
         let contents = os.fs.read_to_string(path.as_ref()).await?;
@@ -204,22 +241,6 @@ impl McpServerConfig {
         Ok(())
     }
 
-    fn from_slice(slice: &[u8], stderr: &mut impl Write, location: &str) -> eyre::Result<McpServerConfig> {
-        match serde_json::from_slice::<Self>(slice) {
-            Ok(config) => Ok(config),
-            Err(e) => {
-                queue!(
-                    stderr,
-                    style::SetForegroundColor(style::Color::Yellow),
-                    style::Print("WARNING: "),
-                    style::ResetColor,
-                    style::Print(format!("Error reading {location} mcp config: {e}\n")),
-                    style::Print("Please check to make sure config is correct. Discarding.\n"),
-                )?;
-                Ok(McpServerConfig::default())
-            },
-        }
-    }
 }
 
 #[derive(Default)]
@@ -257,7 +278,7 @@ impl ToolManagerBuilder {
         mut output: Box<dyn Write + Send + Sync + 'static>,
         interactive: bool,
     ) -> eyre::Result<ToolManager> {
-        let McpServerConfig { mcp_servers } = self.mcp_server_config.ok_or(eyre::eyre!("Missing mcp server config"))?;
+        let McpServerConfig { mcp_servers, use_profile_servers_only: _ } = self.mcp_server_config.ok_or(eyre::eyre!("Missing mcp server config"))?;
         debug_assert!(self.conversation_id.is_some());
         let conversation_id = self.conversation_id.ok_or(eyre::eyre!("Missing conversation id"))?;
         let regex = regex::Regex::new(VALID_TOOL_NAME)?;

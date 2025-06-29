@@ -185,7 +185,7 @@ impl ChatArgs {
         let stdout = std::io::stdout();
         let mut stderr = std::io::stderr();
 
-        let mcp_server_configs = match McpServerConfig::load_config(&mut stderr).await {
+        let mcp_server_configs = match tool_manager::get_mcp_server_configs_for_profile(os, self.profile.as_deref()).await {
             Ok(config) => {
                 if !os.database.settings.get_bool(Setting::McpLoadedBefore).unwrap_or(false) {
                     execute!(
@@ -196,6 +196,18 @@ impl ChatArgs {
                     )?;
                 }
                 os.database.settings.set(Setting::McpLoadedBefore, true).await?;
+                
+                // Display profile exclusivity warning if applicable
+                if config.use_profile_servers_only {
+                    execute!(
+                        stderr,
+                        style::SetForegroundColor(style::Color::DarkYellow),
+                        style::Print("⚠ useProfileServersOnly is set to 'true' for this profile. Other mcp configs will be ignored."),
+                        style::SetForegroundColor(style::Color::Reset),
+                        style::Print("\n\n")
+                    )?;
+                }
+                
                 config
             },
             Err(e) => {

@@ -40,7 +40,11 @@ use super::token_counter::{
     CharCount,
     CharCounter,
 };
-use super::tool_manager::ToolManager;
+use super::tool_manager::{
+    ToolManager,
+    ToolManagerBuilder,
+    get_mcp_server_configs_for_profile,
+};
 use super::tools::{
     InputSchema,
     QueuedTool,
@@ -272,6 +276,135 @@ impl ConversationState {
         if let Ok(cwd) = std::env::current_dir() {
             os.database.set_conversation_by_path(cwd, self).ok();
         }
+    }
+
+    /// Reloads MCP servers for the specified profile, preserving conversation continuity
+    /// and trust settings. This allows hot-swapping servers when profiles change.
+    pub async fn reload_mcp_servers_for_profile(
+        &mut self,
+        os: &mut Os,
+        profile_name: Option<&str>,
+        stderr: &mut impl Write,
+    ) -> eyre::Result<()> {
+        debug!("Starting MCP server reload for profile: {:?}", profile_name);
+        
+        // Provide user feedback about the reload process
+        execute!(
+            stderr,
+            style::SetForegroundColor(style::Color::DarkYellow),
+            style::Print("Reloading MCP servers for profile..."),
+            style::SetForegroundColor(style::Color::Reset),
+            style::Print("\n")
+        )?;
+
+        // Preserve current trust settings and tool state before reloading
+        // Note: In this implementation, trust settings are handled at the tool level
+        // and will be preserved through the atomic state update process
+        let _current_tools_backup = self.tools.clone();
+        
+        // Load the new MCP configuration for the specified profile
+        let mcp_config = match get_mcp_server_configs_for_profile(os, profile_name).await {
+            Ok(config) => {
+                // Display profile exclusivity warning if applicable
+                if config.use_profile_servers_only {
+                    execute!(
+                        stderr,
+                        style::SetForegroundColor(style::Color::DarkYellow),
+                        style::Print("⚠ useProfileServersOnly is set to 'true' for this profile. Other mcp configs will be ignored."),
+                        style::SetForegroundColor(style::Color::Reset),
+                        style::Print("\n")
+                    )?;
+                }
+                config
+            },
+            Err(e) => {
+                warn!("Failed to load MCP configuration for profile {:?}: {}", profile_name, e);
+                execute!(
+                    stderr,
+                    style::SetForegroundColor(style::Color::DarkRed),
+                    style::Print("Warning: Failed to load MCP configuration. Using existing servers."),
+                    style::SetForegroundColor(style::Color::Reset),
+                    style::Print("\n")
+                )?;
+                return Ok(()); // Graceful degradation - continue with existing servers
+            }
+        };
+
+        // Create a new tool manager with the updated configuration
+        let mut new_tool_manager = match ToolManagerBuilder::default()
+            .mcp_server_config(mcp_config)
+            .conversation_id(&self.conversation_id)
+            .build(os, Box::new(std::io::sink()), false) // Non-interactive for reload
+            .await
+        {
+            Ok(manager) => manager,
+            Err(e) => {
+                error!("Failed to create new tool manager during reload: {}", e);
+                execute!(
+                    stderr,
+                    style::SetForegroundColor(style::Color::DarkRed),
+                    style::Print("Warning: Failed to initialize new MCP servers. Keeping existing servers."),
+                    style::SetForegroundColor(style::Color::Reset),
+                    style::Print("\n")
+                )?;
+                return Ok(()); // Graceful degradation - keep existing tool manager
+            }
+        };
+
+        // Load tools from the new manager
+        let new_tools = match new_tool_manager.load_tools(os, &mut std::io::sink()).await {
+            Ok(tools) => tools,
+            Err(e) => {
+                error!("Failed to load tools from new tool manager: {}", e);
+                execute!(
+                    stderr,
+                    style::SetForegroundColor(style::Color::DarkRed),
+                    style::Print("Warning: Failed to load new MCP tools. Keeping existing tools."),
+                    style::SetForegroundColor(style::Color::Reset),
+                    style::Print("\n")
+                )?;
+                return Ok(()); // Graceful degradation
+            }
+        };
+
+        // Atomically update the conversation state with new tools and tool manager
+        // This preserves conversation history while updating available tools
+        let old_tool_manager = std::mem::replace(&mut self.tool_manager, new_tool_manager);
+        
+        // Update tools mapping, preserving native tools and updating MCP tools
+        self.tools = new_tools
+            .into_values()
+            .fold(HashMap::<ToolOrigin, Vec<Tool>>::new(), |mut acc, v| {
+                let tool = Tool::ToolSpecification(ToolSpecification {
+                    name: v.name,
+                    description: v.description,
+                    input_schema: v.input_schema.into(),
+                });
+                acc.entry(v.tool_origin)
+                    .and_modify(|tools| tools.push(tool.clone()))
+                    .or_insert(vec![tool]);
+                acc
+            });
+
+        // Force an update to ensure all tool states are synchronized
+        self.update_state(true).await;
+
+        // Provide success feedback to the user
+        let tool_count = self.tools.values().map(|v| v.len()).sum::<usize>();
+        execute!(
+            stderr,
+            style::SetForegroundColor(style::Color::DarkGreen),
+            style::Print(format!("✓ MCP servers reloaded successfully. {} tools available.", tool_count)),
+            style::SetForegroundColor(style::Color::Reset),
+            style::Print("\n")
+        )?;
+
+        debug!("MCP server reload completed successfully for profile: {:?}", profile_name);
+        
+        // Note: The old tool manager will be dropped here, cleaning up old server connections
+        drop(old_tool_manager);
+        
+        Ok(())
     }
 
     /// Returns the conversation id.
